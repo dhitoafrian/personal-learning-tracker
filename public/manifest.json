@@ -1,7 +1,7 @@
 {
-  "name": "Personal Learning Tracker",
-  "short_name": "LearnTracker",
-  "description": "Minimalist dark-mode personal learning tracker",
+  "name": "Kaze",
+  "short_name": "Kaze",
+  "description": "Catatan digital",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#09090b",
