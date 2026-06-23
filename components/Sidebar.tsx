@@ -2,12 +2,14 @@
 import { useState, useEffect } from "react";
 import { supabase } from "@/lib/supabase"; 
 import { Folder, Plus, Trash2, LogOut } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
-export default function Sidebar({ onSelectFolder }: { onSelectFolder: (id: string) => void }) {
+export default function Sidebar() {
   const [folders, setFolders] = useState<{ id: string; name: string }[]>([]);
   const [newFolderName, setNewFolderName] = useState("");
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const activeFolder = searchParams.get("folder");
 
   useEffect(() => {
     checkAuth();
@@ -45,7 +47,9 @@ export default function Sidebar({ onSelectFolder }: { onSelectFolder: (id: strin
     const { error } = await supabase.from("folders").delete().eq("id", id);
     if (!error) {
       setFolders(folders.filter(f => f.id !== id));
-      onSelectFolder(""); // Reset selection if deleted
+      if (activeFolder === id) {
+        router.push("/");
+      }
     }
   };
 
@@ -56,8 +60,13 @@ export default function Sidebar({ onSelectFolder }: { onSelectFolder: (id: strin
 
   return (
     <div className="w-full md:w-64 h-auto md:h-screen flex-none bg-zinc-950 border-b md:border-b-0 md:border-r border-zinc-800 text-zinc-100 p-4 flex flex-col">
-      <div className="flex items-center justify-between md:mb-4">
-        <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-wider hidden md:block">Workspace</h2>
+      <div className="flex items-center justify-between mb-2 md:mb-4">
+        <button 
+          onClick={() => router.push("/")} 
+          className="text-sm font-semibold text-zinc-400 uppercase tracking-wider hover:text-zinc-100 transition-colors"
+        >
+          Workspace
+        </button>
         <button onClick={handleLogout} className="text-zinc-500 hover:text-zinc-300 md:block hidden" title="Logout">
           <LogOut size={16} />
         </button>
@@ -84,10 +93,14 @@ export default function Sidebar({ onSelectFolder }: { onSelectFolder: (id: strin
         {folders.map(f => (
           <div key={f.id} className="group relative flex items-center shrink-0 md:w-full">
             <button 
-              onClick={() => onSelectFolder(f.id)} 
-              className="flex-1 flex items-center gap-2 md:gap-3 w-full text-left px-3 py-2 bg-zinc-900 md:bg-transparent hover:bg-zinc-800 md:hover:bg-zinc-900 border border-zinc-800 md:border-transparent rounded-md text-sm text-zinc-300 hover:text-zinc-50 transition-colors pr-8 md:pr-3"
+              onClick={() => router.push(`/?folder=${f.id}`)} 
+              className={`flex-1 flex items-center gap-2 md:gap-3 w-full text-left px-3 py-2 border rounded-md text-sm transition-colors pr-8 md:pr-3 ${
+                activeFolder === f.id 
+                  ? "bg-zinc-800 border-zinc-700 text-zinc-50" 
+                  : "bg-zinc-900 md:bg-transparent hover:bg-zinc-800 border-zinc-800 md:border-transparent text-zinc-300 hover:text-zinc-50"
+              }`}
             >
-              <Folder size={16} className="text-zinc-500 shrink-0" />
+              <Folder size={16} className={`${activeFolder === f.id ? "text-zinc-300" : "text-zinc-500"} shrink-0`} />
               <span className="truncate max-w-[120px] md:max-w-none">{f.name}</span>
             </button>
             <button 

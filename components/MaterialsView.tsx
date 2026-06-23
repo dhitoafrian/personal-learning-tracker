@@ -1,8 +1,11 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import { Image as ImageIcon, X, Loader2, Trash2, Search, Plus, Camera, Pencil, Eye } from "lucide-react";
+import { Image as ImageIcon, X, Loader2, Trash2, Search, Plus, Camera, Pencil } from "lucide-react";
 import imageCompression from "browser-image-compression";
+
+const PAGE_SIZE = 10;
 
 interface Material {
   id: string;
@@ -12,15 +15,77 @@ interface Material {
   created_at: string;
 }
 
-export default function MaterialsView({ folderId }: { folderId: string }) {
+// Custom in-app confirmation dialog (avoids native confirm() which is blocked in PWA)
+function ConfirmDialog({
+  message,
+  onConfirm,
+  onCancel,
+}: {
+  message: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/70 p-4"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-sm bg-zinc-900 border border-zinc-800 rounded-2xl p-6 space-y-4"
+        onClick={e => e.stopPropagation()}
+      >
+        <p className="text-sm text-zinc-300">{message}</p>
+        <div className="flex gap-3">
+          <button
+            onClick={onCancel}
+            className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 py-2.5 rounded-lg text-sm font-medium transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="flex-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 py-2.5 rounded-lg text-sm font-medium transition-colors border border-red-500/30"
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Simple toast notification
+function Toast({ message, onDone }: { message: string; onDone: () => void }) {
+  useEffect(() => {
+    const t = setTimeout(onDone, 2500);
+    return () => clearTimeout(t);
+  }, [onDone]);
+  return (
+    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm px-5 py-3 rounded-full shadow-2xl animate-in fade-in slide-in-from-bottom-4 duration-200">
+      {message}
+    </div>
+  );
+}
+
+export default function MaterialsView({
+  folderId,
+  initialEditId,
+}: {
+  folderId: string;
+  initialEditId?: string | null;
+}) {
+  const router = useRouter();
   const [materials, setMaterials] = useState<Material[]>([]);
   const [loading, setLoading] = useState(true);
-  
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const pageRef = useRef(0);
+
   // UI States
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [zoomedImage, setZoomedImage] = useState<string | null>(null);
-  const [detailMaterial, setDetailMaterial] = useState<Material | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null); // id to delete
 
   // Form states
   const [title, setTitle] = useState("");
@@ -30,82 +95,157 @@ export default function MaterialsView({ folderId }: { folderId: string }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [existingImages, setExistingImages] = useState<string[]>([]);
 
-  useEffect(() => {
-    fetchMaterials();
-    handleCancel(); // Reset form states when folder changes
-  }, [folderId]);
+  // Infinite scroll sentinel
+  const sentinelRef = useRef<HTMLDivElement>(null);
 
-  async function fetchMaterials() {
+  // ─── Edit & Cancel ────────────────────────────────────────────────────────
+  const handleCancel = useCallback(() => {
+    setTitle("");
+    setContent("");
+    setSelectedFiles([]);
+    setEditingId(null);
+    setExistingImages([]);
+    setIsFormOpen(false);
+  }, []);
+
+  const startEdit = useCallback((material: Material) => {
+    setEditingId(material.id);
+    setTitle(material.title);
+    setContent(material.content || "");
+    setSelectedFiles([]);
+    setExistingImages(material.images || []);
+    setIsFormOpen(true);
+    // No window.scrollTo - use smooth scroll via CSS/ref instead
+    document.getElementById("materials-form-top")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
+  const toggleForm = useCallback(() => {
+    if (isFormOpen) handleCancel();
+    else setIsFormOpen(true);
+  }, [isFormOpen, handleCancel]);
+
+  // ─── Fetch (first page) ───────────────────────────────────────────────────
+  const fetchFirstPage = useCallback(async () => {
     setLoading(true);
-    const { data, error } = await supabase
+    pageRef.current = 0;
+    const { data } = await supabase
       .from("materials")
       .select("*")
       .eq("folder_id", folderId)
-      .order("created_at", { ascending: false });
+      .order("created_at", { ascending: false })
+      .range(0, PAGE_SIZE - 1);
 
-    if (data) setMaterials(data);
+    setMaterials(data ?? []);
+    setHasMore((data?.length ?? 0) === PAGE_SIZE);
     setLoading(false);
-  }
+  }, [folderId]);
 
+  // ─── Fetch next page ─────────────────────────────────────────────────────
+  const fetchNextPage = useCallback(async () => {
+    if (loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    const nextPage = pageRef.current + 1;
+    const from = nextPage * PAGE_SIZE;
+    const to = from + PAGE_SIZE - 1;
+
+    const { data } = await supabase
+      .from("materials")
+      .select("*")
+      .eq("folder_id", folderId)
+      .order("created_at", { ascending: false })
+      .range(from, to);
+
+    if (data && data.length > 0) {
+      setMaterials(prev => [...prev, ...data]);
+      pageRef.current = nextPage;
+      setHasMore(data.length === PAGE_SIZE);
+    } else {
+      setHasMore(false);
+    }
+    setLoadingMore(false);
+  }, [folderId, hasMore, loadingMore]);
+
+  // ─── IntersectionObserver for infinite scroll ─────────────────────────────
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(
+      entries => {
+        if (entries[0].isIntersecting) {
+          fetchNextPage();
+        }
+      },
+      { threshold: 0.1 }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [fetchNextPage]);
+
+  // ─── Reload on folder change ──────────────────────────────────────────────
+  useEffect(() => {
+    fetchFirstPage();
+    setTimeout(() => {
+      handleCancel();
+      setSearchQuery("");
+    }, 0);
+  }, [folderId, fetchFirstPage, handleCancel]);
+
+  // ─── Auto-open edit from ?edit= query param ───────────────────────────────
+  useEffect(() => {
+    if (!initialEditId || materials.length === 0) return;
+    const target = materials.find(m => m.id === initialEditId);
+    if (target) {
+      setTimeout(() => {
+        startEdit(target);
+      }, 0);
+    }
+    // clear the edit query param without reloading, but KEEP the folder param
+    router.replace(`/?folder=${folderId}`, { scroll: false });
+  }, [initialEditId, materials, router, startEdit, folderId]);
+
+  // ─── File handling ────────────────────────────────────────────────────────
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      const filesArray = Array.from(e.target.files);
-      setSelectedFiles((prev) => [...prev, ...filesArray]);
+      setSelectedFiles(prev => [...prev, ...Array.from(e.target.files!)]);
     }
   };
 
   const removeFile = (index: number) => {
-    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
+    setSelectedFiles(prev => prev.filter((_, i) => i !== index));
   };
 
+  // ─── Compress & upload ────────────────────────────────────────────────────
   const compressAndUpload = async (file: File): Promise<string | null> => {
-    const options = {
-      maxSizeMB: 1, // Diubah ke 1MB sebagai jalan tengah (kualitas tetap bagus, storage aman)
-      maxWidthOrHeight: 1920,
-      useWebWorker: true,
-      initialQuality: 0.8, // Kualitas awal diturunkan sedikit untuk memastikan file cukup kecil
-    };
-
     try {
-      const compressedFile = await imageCompression(file, options);
-      const fileExt = compressedFile.name.split('.').pop();
-      const fileName = `${Math.random().toString(36).substring(2, 15)}_${Date.now()}.${fileExt}`;
-      const filePath = `${folderId}/${fileName}`;
-
-      const { data, error } = await supabase.storage
-        .from("material-assets")
-        .upload(filePath, compressedFile);
-
-      if (error) {
-        console.error("Upload error:", error);
-        return null;
-      }
-
-      const { data: publicUrlData } = supabase.storage
-        .from("material-assets")
-        .getPublicUrl(filePath);
-
-      return publicUrlData.publicUrl;
-    } catch (error) {
-      console.error("Compression error:", error);
+      const compressed = await imageCompression(file, {
+        maxSizeMB: 1,
+        maxWidthOrHeight: 1920,
+        useWebWorker: true,
+        initialQuality: 0.8,
+      });
+      const ext = compressed.name.split(".").pop();
+      const filePath = `${folderId}/${Math.random().toString(36).slice(2)}_${Date.now()}.${ext}`;
+      const { error } = await supabase.storage.from("material-assets").upload(filePath, compressed);
+      if (error) return null;
+      return supabase.storage.from("material-assets").getPublicUrl(filePath).data.publicUrl;
+    } catch {
       return null;
     }
   };
 
+  // ─── Submit (add / edit) ──────────────────────────────────────────────────
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim()) return;
-    
     setIsSubmitting(true);
-    
+
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) {
-      alert("Please login first");
+      setToast("Session expired. Please login again.");
       setIsSubmitting(false);
       return;
     }
 
-    // Upload images first
     const uploadedUrls: string[] = [];
     for (const file of selectedFiles) {
       const url = await compressAndUpload(file);
@@ -113,143 +253,99 @@ export default function MaterialsView({ folderId }: { folderId: string }) {
     }
 
     if (editingId) {
-      // Update logic
       const updatedImages = [...existingImages, ...uploadedUrls];
-      
-      // Hapus file fisik dari storage jika ada gambar yang di-remove saat edit
-      const originalMaterial = materials.find(m => m.id === editingId);
-      if (originalMaterial && originalMaterial.images) {
-        const deletedImages = originalMaterial.images.filter(img => !existingImages.includes(img));
-        if (deletedImages.length > 0) {
-          const pathsToDelete = deletedImages.map(url => {
-            const parts = url.split("/public/material-assets/");
-            return parts.length > 1 ? parts[1] : null;
-          }).filter(Boolean) as string[];
 
-          if (pathsToDelete.length > 0) {
-            supabase.storage.from("material-assets").remove(pathsToDelete).catch(err => {
-              console.error("Storage cleanup failed:", err);
-            });
-          }
-        }
+      // Garbage collect removed images from storage
+      const original = materials.find(m => m.id === editingId);
+      if (original?.images) {
+        const removed = original.images.filter(img => !existingImages.includes(img));
+        const paths = removed
+          .map(url => url.split("/public/material-assets/")[1])
+          .filter(Boolean);
+        if (paths.length > 0) supabase.storage.from("material-assets").remove(paths);
       }
 
       const { error } = await supabase
         .from("materials")
-        .update({
-          title: title,
-          content: content || null,
-          images: updatedImages
-        })
+        .update({ title, content: content || null, images: updatedImages })
         .eq("id", editingId);
 
-      if (error) {
-        alert("Failed to update material: " + error.message);
-      } else {
+      if (!error) {
         handleCancel();
-        fetchMaterials();
+        fetchFirstPage();
+        setToast("Note updated.");
       }
     } else {
-      // Insert logic
       const { error } = await supabase.from("materials").insert([{
         folder_id: folderId,
         user_id: user.id,
-        title: title,
+        title,
         content: content || null,
-        images: uploadedUrls
+        images: uploadedUrls,
       }]);
 
-      if (error) {
-        alert("Failed to save material: " + error.message);
-      } else {
+      if (!error) {
         handleCancel();
-        fetchMaterials();
+        fetchFirstPage();
+        setToast("Note saved.");
       }
     }
-    
+
     setIsSubmitting(false);
   };
 
-  const deleteMaterial = async (id: string) => {
-    if (!confirm("Delete this material?")) return;
-    
-    // Cari material yang ingin didelete untuk dihapus gambarnya dari storage
-    const targetMaterial = materials.find(m => m.id === id);
+  // ─── Delete ───────────────────────────────────────────────────────────────
+  const confirmAndDelete = (id: string) => setConfirmDelete(id);
 
+  const executDelete = async () => {
+    const id = confirmDelete;
+    setConfirmDelete(null);
+    if (!id) return;
+
+    const target = materials.find(m => m.id === id);
     const { error } = await supabase.from("materials").delete().eq("id", id);
     if (!error) {
-      setMaterials(materials.filter(m => m.id !== id));
-      if (detailMaterial?.id === id) {
-        setDetailMaterial(null);
+      setMaterials(prev => prev.filter(m => m.id !== id));
+      // Cleanup storage
+      if (target?.images?.length) {
+        const paths = target.images
+          .map(url => url.split("/public/material-assets/")[1])
+          .filter(Boolean);
+        if (paths.length > 0) supabase.storage.from("material-assets").remove(paths);
       }
-
-      // Hapus semua file fisik gambar dari storage
-      if (targetMaterial && targetMaterial.images && targetMaterial.images.length > 0) {
-        const pathsToDelete = targetMaterial.images.map(url => {
-          const parts = url.split("/public/material-assets/");
-          return parts.length > 1 ? parts[1] : null;
-        }).filter(Boolean) as string[];
-
-        if (pathsToDelete.length > 0) {
-          supabase.storage.from("material-assets").remove(pathsToDelete).catch(err => {
-            console.error("Storage deletion failed:", err);
-          });
-        }
-      }
+      setToast("Note deleted.");
     }
   };
 
-  const startEdit = (material: Material) => {
-    setEditingId(material.id);
-    setTitle(material.title);
-    setContent(material.content || "");
-    setSelectedFiles([]);
-    setExistingImages(material.images || []);
-    setIsFormOpen(true);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
-  const handleCancel = () => {
-    setTitle("");
-    setContent("");
-    setSelectedFiles([]);
-    setEditingId(null);
-    setExistingImages([]);
-    setIsFormOpen(false);
-  };
-
-  const toggleForm = () => {
-    if (isFormOpen) {
-      handleCancel();
-    } else {
-      setIsFormOpen(true);
-    }
-  };
+  // ─── Filter ───────────────────────────────────────────────────────────────
+  const filteredMaterials = searchQuery
+    ? materials.filter(m => m.title.toLowerCase().includes(searchQuery.toLowerCase()))
+    : materials;
 
   if (loading) {
-    return <div className="flex h-full items-center justify-center text-zinc-500"><Loader2 className="animate-spin" /></div>;
+    return (
+      <div className="flex h-full items-center justify-center text-zinc-500">
+        <Loader2 className="animate-spin" />
+      </div>
+    );
   }
 
-  const filteredMaterials = materials.filter(m => 
-    m.title.toLowerCase().includes(searchQuery.toLowerCase())
-  );
-
   return (
-    <div className="flex flex-col gap-6 pb-10">
-      
-      {/* HEADER / TOOLBAR */}
+    <div className="flex flex-col gap-6 pb-10" id="materials-form-top">
+
+      {/* TOOLBAR */}
       <div className="flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
         <div className="relative w-full sm:w-64">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" size={16} />
-          <input 
-            type="text" 
-            placeholder="Search notes..." 
+          <input
+            type="text"
+            placeholder="Search notes..."
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={e => setSearchQuery(e.target.value)}
             className="w-full bg-zinc-900 border border-zinc-800 text-zinc-100 rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-600 transition-all placeholder:text-zinc-600"
           />
         </div>
-        <button 
+        <button
           onClick={toggleForm}
           className={`flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors w-full sm:w-auto ${
             isFormOpen ? "bg-zinc-800 text-zinc-300 hover:bg-zinc-700" : "bg-zinc-100 text-zinc-900 hover:bg-white"
@@ -260,12 +356,12 @@ export default function MaterialsView({ folderId }: { folderId: string }) {
         </button>
       </div>
 
-      {/* COLLAPSIBLE ADD/EDIT MATERIAL FORM */}
-      <div className={`grid transition-all duration-300 ease-in-out ${isFormOpen ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'}`}>
+      {/* COLLAPSIBLE FORM */}
+      <div className={`grid transition-all duration-300 ease-in-out ${isFormOpen ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"}`}>
         <div className="overflow-hidden">
           <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 mb-2">
             <h3 className="text-sm font-medium text-zinc-300 mb-4">
-              {editingId ? `Edit Note: ${title}` : "Add New Material / Note"}
+              {editingId ? `Edit: ${title}` : "Add New Note"}
             </h3>
             <form onSubmit={handleSubmit} className="flex flex-col gap-4">
               <input
@@ -274,29 +370,28 @@ export default function MaterialsView({ folderId }: { folderId: string }) {
                 required
                 className="bg-zinc-950 border border-zinc-800 text-zinc-100 rounded-lg p-3 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-600 w-full"
                 value={title}
-                onChange={(e) => setTitle(e.target.value)}
+                onChange={e => setTitle(e.target.value)}
               />
               <textarea
                 placeholder="Write your notes here (optional)..."
                 rows={3}
                 className="bg-zinc-950 border border-zinc-800 text-zinc-100 rounded-lg p-3 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-600 w-full resize-y"
                 value={content}
-                onChange={(e) => setContent(e.target.value)}
+                onChange={e => setContent(e.target.value)}
               />
-              
-              {/* EXISTING IMAGES PREVIEW (ONLY IN EDIT MODE) */}
+
+              {/* Existing images in edit mode */}
               {editingId && existingImages.length > 0 && (
                 <div className="flex flex-col gap-2">
                   <span className="text-xs text-zinc-500 font-medium">Current Images:</span>
                   <div className="flex flex-wrap gap-3">
                     {existingImages.map((imgUrl, idx) => (
-                      <div key={idx} className="relative w-20 h-20 bg-zinc-850 rounded-lg overflow-hidden border border-zinc-800">
-                        <img src={imgUrl} alt="existing preview" className="w-full h-full object-cover" />
-                        <button 
-                          type="button" 
+                      <div key={idx} className="relative w-20 h-20 rounded-lg overflow-hidden border border-zinc-800">
+                        <img src={imgUrl} alt="existing" className="w-full h-full object-cover" />
+                        <button
+                          type="button"
                           onClick={() => setExistingImages(existingImages.filter((_, i) => i !== idx))}
                           className="absolute top-1 right-1 bg-black/70 text-zinc-300 rounded-full p-1 hover:bg-red-500 hover:text-white transition-colors"
-                          title="Remove image"
                         >
                           <X size={12} />
                         </button>
@@ -306,16 +401,16 @@ export default function MaterialsView({ folderId }: { folderId: string }) {
                 </div>
               )}
 
-              {/* NEW IMAGE PREVIEW AREA */}
+              {/* New file previews */}
               {selectedFiles.length > 0 && (
                 <div className="flex flex-col gap-2">
-                  <span className="text-xs text-zinc-500 font-medium">New Images to Attach:</span>
+                  <span className="text-xs text-zinc-500 font-medium">New Images:</span>
                   <div className="flex flex-wrap gap-3">
                     {selectedFiles.map((file, idx) => (
                       <div key={idx} className="relative w-20 h-20 bg-zinc-800 rounded-lg overflow-hidden border border-zinc-700">
                         <img src={URL.createObjectURL(file)} alt="preview" className="w-full h-full object-cover" />
-                        <button 
-                          type="button" 
+                        <button
+                          type="button"
                           onClick={() => removeFile(idx)}
                           className="absolute top-1 right-1 bg-black/60 text-white rounded-full p-1 hover:bg-red-500/80 transition-colors"
                         >
@@ -332,41 +427,26 @@ export default function MaterialsView({ folderId }: { folderId: string }) {
                   <label className="cursor-pointer flex items-center gap-2 text-sm text-zinc-400 hover:text-zinc-200 transition-colors bg-zinc-950 border border-zinc-800 px-4 py-2 rounded-lg">
                     <ImageIcon size={16} />
                     <span>Gallery</span>
-                    <input 
-                      type="file" 
-                      multiple 
-                      accept="image/*" 
-                      className="hidden" 
-                      onChange={handleFileSelect} 
-                    />
+                    <input type="file" multiple accept="image/*" className="hidden" onChange={handleFileSelect} />
                   </label>
-                  
-                  {/* TOMBOL KAMERA KHUSUS MOBILE */}
                   <label className="cursor-pointer flex md:hidden items-center gap-2 text-sm text-zinc-400 hover:text-zinc-200 transition-colors bg-zinc-950 border border-zinc-800 px-4 py-2 rounded-lg">
                     <Camera size={16} />
                     <span>Camera</span>
-                    <input 
-                      type="file" 
-                      accept="image/*" 
-                      capture="environment"
-                      className="hidden" 
-                      onChange={handleFileSelect} 
-                    />
+                    <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handleFileSelect} />
                   </label>
                 </div>
-                
                 <div className="flex items-center gap-2 w-full sm:w-auto">
                   {editingId && (
-                    <button 
-                      type="button" 
+                    <button
+                      type="button"
                       onClick={handleCancel}
-                      className="bg-zinc-800 hover:bg-zinc-750 text-zinc-300 px-6 py-2 rounded-lg text-sm font-medium transition-colors w-full sm:w-auto justify-center"
+                      className="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 px-6 py-2 rounded-lg text-sm font-medium transition-colors w-full sm:w-auto justify-center"
                     >
                       Cancel
                     </button>
                   )}
-                  <button 
-                    type="submit" 
+                  <button
+                    type="submit"
                     disabled={isSubmitting || !title.trim()}
                     className="bg-zinc-100 text-zinc-900 px-6 py-2 rounded-lg text-sm font-medium hover:bg-white disabled:opacity-50 flex items-center gap-2 w-full sm:w-auto justify-center"
                   >
@@ -381,170 +461,92 @@ export default function MaterialsView({ folderId }: { folderId: string }) {
 
       {/* MATERIALS LIST */}
       <div className="flex flex-col gap-4">
-        {filteredMaterials.length === 0 ? (
+        {filteredMaterials.length === 0 && !loading ? (
           <div className="text-center text-zinc-500 py-10 border border-dashed border-zinc-800 rounded-xl">
             {searchQuery ? "No notes match your search." : "No notes here yet. Click 'Add Note' to create one!"}
           </div>
         ) : (
           filteredMaterials.map(material => (
-            <div 
-              key={material.id} 
+            <div
+              key={material.id}
               className="bg-zinc-950 border border-zinc-800 hover:border-zinc-700 rounded-xl p-5 group relative transition-all cursor-pointer flex flex-col"
-              onClick={() => setDetailMaterial(material)}
+              onClick={() => router.push(`/material/${material.id}`)}
             >
-              {/* Card Actions (Visible on Hover / Mobile always visible) */}
-              <div 
-                className="absolute top-4 right-4 flex items-center gap-1 opacity-0 group-hover:opacity-100 md:opacity-0 transition-opacity"
-                onClick={(e) => e.stopPropagation()}
+              {/* Actions — visible on hover (desktop) or always on mobile */}
+              <div
+                className="absolute top-4 right-4 flex items-center gap-1 opacity-100 md:opacity-0 group-hover:opacity-100 transition-opacity"
+                onClick={e => e.stopPropagation()}
               >
-                <button 
+                <button
                   onClick={() => startEdit(material)}
                   className="p-1.5 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900 rounded-md transition-colors"
                   title="Edit note"
                 >
                   <Pencil size={15} />
                 </button>
-                <button 
-                  onClick={() => deleteMaterial(material.id)}
+                <button
+                  onClick={() => confirmAndDelete(material.id)}
                   className="p-1.5 text-zinc-500 hover:text-red-400 hover:bg-zinc-900 rounded-md transition-colors"
                   title="Delete note"
                 >
                   <Trash2 size={15} />
                 </button>
               </div>
-              
+
               <h4 className="text-lg font-medium text-zinc-100 pr-16">{material.title}</h4>
-              <p className="text-xs text-zinc-500 mt-1 mb-3">{new Date(material.created_at).toLocaleString()}</p>
-              
+              <p className="text-xs text-zinc-500 mt-1 mb-3">
+                {new Date(material.created_at).toLocaleString()}
+              </p>
+
               {material.content && (
                 <p className="text-sm text-zinc-400 line-clamp-3 whitespace-pre-wrap mb-4 pr-2">
                   {material.content}
                 </p>
               )}
-              
+
               {material.images && material.images.length > 0 && (
                 <div className="flex flex-wrap gap-2 mt-auto pt-2">
-                  {material.images.map((imgUrl, idx) => (
-                    <button 
-                      key={idx} 
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation(); // Stop opening the detail modal
-                        setZoomedImage(imgUrl);
-                      }}
-                      className="block w-20 h-20 rounded-lg overflow-hidden border border-zinc-900 hover:border-zinc-650 transition-colors focus:outline-none focus:ring-1 focus:ring-zinc-600 shrink-0"
+                  {material.images.slice(0, 4).map((imgUrl, idx) => (
+                    <div
+                      key={idx}
+                      className="block w-20 h-20 rounded-lg overflow-hidden border border-zinc-900 shrink-0"
                     >
-                      <img src={imgUrl} alt={`Attachment ${idx+1}`} className="w-full h-full object-cover" />
-                    </button>
+                      <img src={imgUrl} alt={`Attachment ${idx + 1}`} className="w-full h-full object-cover" />
+                    </div>
                   ))}
+                  {material.images.length > 4 && (
+                    <div className="w-20 h-20 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center text-zinc-500 text-sm font-medium shrink-0">
+                      +{material.images.length - 4}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
           ))
         )}
+
+        {/* INFINITE SCROLL SENTINEL */}
+        {!searchQuery && (
+          <div ref={sentinelRef} className="py-4 flex justify-center">
+            {loadingMore && <Loader2 className="animate-spin text-zinc-600" size={20} />}
+            {!hasMore && materials.length > 0 && (
+              <p className="text-xs text-zinc-700">All notes loaded.</p>
+            )}
+          </div>
+        )}
       </div>
 
-      {/* DETAIL VIEW MODAL */}
-      {detailMaterial && (
-        <div 
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/85 p-4 backdrop-blur-sm animate-in fade-in duration-200"
-          onClick={() => setDetailMaterial(null)}
-        >
-          <div 
-            className="w-full max-w-2xl bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-2xl flex flex-col max-h-[85vh] overflow-y-auto"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {/* Modal Header */}
-            <div className="flex justify-between items-start gap-4 mb-4">
-              <div>
-                <h3 className="text-xl font-semibold text-zinc-100">{detailMaterial.title}</h3>
-                <p className="text-xs text-zinc-500 mt-1">{new Date(detailMaterial.created_at).toLocaleString()}</p>
-              </div>
-              <div className="flex items-center gap-1">
-                <button 
-                  onClick={() => {
-                    startEdit(detailMaterial);
-                    setDetailMaterial(null);
-                  }}
-                  className="p-2 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors"
-                  title="Edit note"
-                >
-                  <Pencil size={16} />
-                </button>
-                <button 
-                  onClick={() => {
-                    deleteMaterial(detailMaterial.id);
-                    setDetailMaterial(null);
-                  }}
-                  className="p-2 text-zinc-500 hover:text-red-400 hover:bg-zinc-800 rounded-lg transition-colors"
-                  title="Delete note"
-                >
-                  <Trash2 size={16} />
-                </button>
-                <button 
-                  onClick={() => setDetailMaterial(null)}
-                  className="p-2 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors ml-1"
-                >
-                  <X size={18} />
-                </button>
-              </div>
-            </div>
-
-            {/* Modal Content */}
-            <div className="flex-1 overflow-y-auto space-y-6 pr-1 border-t border-zinc-800 pt-4">
-              {detailMaterial.content ? (
-                <p className="text-sm text-zinc-300 whitespace-pre-wrap leading-relaxed">
-                  {detailMaterial.content}
-                </p>
-              ) : (
-                <p className="text-sm text-zinc-600 italic">No text content in this note.</p>
-              )}
-
-              {detailMaterial.images && detailMaterial.images.length > 0 && (
-                <div className="space-y-3 pt-2">
-                  <h4 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Attached Images</h4>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                    {detailMaterial.images.map((imgUrl, idx) => (
-                      <button 
-                        key={idx} 
-                        type="button"
-                        onClick={() => setZoomedImage(imgUrl)}
-                        className="group relative aspect-square rounded-lg overflow-hidden border border-zinc-800 hover:border-zinc-500 transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-500"
-                      >
-                        <img src={imgUrl} alt={`Attachment ${idx+1}`} className="w-full h-full object-cover transition-transform group-hover:scale-102" />
-                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
-                          <Eye size={20} className="text-white" />
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+      {/* IN-APP DELETE CONFIRMATION */}
+      {confirmDelete && (
+        <ConfirmDialog
+          message="Delete this note? All attached images will also be permanently removed."
+          onConfirm={executDelete}
+          onCancel={() => setConfirmDelete(null)}
+        />
       )}
 
-      {/* IMAGE LIGHTBOX / ZOOM OVERLAY */}
-      {zoomedImage && (
-        <div 
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4 backdrop-blur-sm cursor-zoom-out animate-in fade-in duration-200"
-          onClick={() => setZoomedImage(null)}
-        >
-          <button 
-            className="absolute top-4 right-4 md:top-6 md:right-6 text-zinc-400 hover:text-white bg-zinc-900/50 p-2 rounded-full transition-colors"
-            onClick={() => setZoomedImage(null)}
-          >
-            <X size={24} />
-          </button>
-          <img 
-            src={zoomedImage} 
-            alt="Zoomed attachment" 
-            className="max-w-full max-h-full object-contain rounded-lg shadow-2xl cursor-default" 
-            onClick={(e) => e.stopPropagation()} 
-          />
-        </div>
-      )}
+      {/* TOAST */}
+      {toast && <Toast message={toast} onDone={() => setToast(null)} />}
     </div>
   );
 }
